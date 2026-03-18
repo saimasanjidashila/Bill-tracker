@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import smtplib
+from datetime import date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
@@ -200,25 +201,13 @@ def get_all_active_tracked_bills_grouped(supabase: Client):
     return grouped
 
 
-def already_sent(supabase: Client, user_email: str, bill_number: str, meeting_url: str) -> bool:
-    response = (
-        supabase.table("sent_alerts")
-        .select("id")
-        .eq("user_email", user_email.lower())
-        .eq("bill_number", bill_number.upper())
-        .eq("meeting_url", meeting_url)
-        .limit(1)
-        .execute()
-    )
-    return len(response.data or []) > 0
-
-
 def log_sent_alert(supabase: Client, user_email: str, bill_number: str, meeting_url: str):
     supabase.table("sent_alerts").insert(
         {
             "user_email": user_email.lower(),
             "bill_number": bill_number.upper(),
             "meeting_url": meeting_url,
+            "sent_date": date.today().isoformat(),
         }
     ).execute()
 
@@ -243,9 +232,6 @@ def find_matches(supabase: Client):
 
                 for bill_number, saved_text in selected_bills.items():
                     if bill_number in page_bills:
-                        if already_sent(supabase, email, bill_number, item["url"]):
-                            continue
-
                         user_matches.append(
                             {
                                 "email": email,
