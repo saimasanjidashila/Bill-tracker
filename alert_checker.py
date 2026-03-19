@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
-
+print("=== ALERT CHECKER VERSION 2026-03-19-A ===", flush=True)
 
 # =========================
 # CONFIG
