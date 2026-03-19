@@ -111,7 +111,7 @@ def extract_bills_from_page(soup):
     return results
 
 
-def extract_insurance_committee_links(home_soup):
+def extract_committee_links(home_soup):
     rows = []
     seen = set()
 
@@ -132,7 +132,7 @@ def extract_insurance_committee_links(home_soup):
             continue
         if "agenda.aspx" not in full_url.lower():
             continue
-        if "agenda.aspx" not in full_url.lower():
+        if not label:
             continue
 
         tr = a.find_parent("tr")
@@ -159,10 +159,8 @@ def extract_insurance_committee_links(home_soup):
         )
 
         context_upper = row_text.upper()
-        if "SENATE" in context_upper:
-            committee_name = "Senate Insurance"
-        else:
-            committee_name = "House Insurance"
+        chamber = "Senate" if "SENATE" in context_upper else "House"
+        committee_name = f"{chamber} {label.strip()}"
 
         rows.append(
             {
@@ -218,14 +216,14 @@ def find_matches(supabase: Client):
         return []
 
     home_soup = fetch_page(HOME_URL)
-    insurance_links = extract_insurance_committee_links(home_soup)
+    committee_links = extract_committee_links(home_soup)
 
     results = []
 
     for email, selected_bills in users.items():
         user_matches = []
 
-        for item in insurance_links:
+        for item in committee_links:
             try:
                 page_soup = fetch_page(item["url"])
                 page_bills = extract_bills_from_page(page_soup)
@@ -301,7 +299,7 @@ def build_email_body(items):
 
     return f"""
     <h2>Louisiana Bill Alert</h2>
-    <p>The following saved bill(s) matched an Insurance committee meeting:</p>
+    <p>The following saved bill(s) matched upcoming committee meetings:</p>
     {''.join(lines)}
     """
 
