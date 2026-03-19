@@ -60,10 +60,10 @@ REQUEST_TIMEOUT = 30
 # LOGGING
 # =========================
 
+
 def log(message: str):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {message}")
-
+    print(f"[{now}] {message}", flush=True)
 
 # =========================
 # HELPERS
