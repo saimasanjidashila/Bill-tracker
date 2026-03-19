@@ -7,7 +7,8 @@ from datetime import datetime, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.parse import urljoin
-
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 from supabase import create_client, Client
@@ -18,7 +19,7 @@ from supabase import create_client, Client
 # =========================
 
 HOME_URL = "https://legis.la.gov/Legis/Home.aspx"
-
+LOCAL_TZ = ZoneInfo("America/Chicago")
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -169,10 +170,14 @@ def meeting_date_to_iso(meeting_date: str) -> str:
     return ""
 
 
+
+def today_local() -> date:
+    return datetime.now(LOCAL_TZ).date()
+
+
 def is_today_date(meeting_date: str) -> bool:
     iso = meeting_date_to_iso(meeting_date)
-    return iso == date.today().isoformat()
-
+    return iso == today_local().isoformat()
 
 def parse_room(text: str) -> str:
     text = normalize_whitespace(text)
@@ -565,7 +570,7 @@ def build_combined_email_html(alerts: list[dict]) -> str:
 # =========================
 # MAIN PROCESS
 # =========================
-
+log(f"Local Louisiana date used for matching: {today_local().isoformat()}")
 def process_alerts():
     log("==== START alert-checker.py ====")
 
