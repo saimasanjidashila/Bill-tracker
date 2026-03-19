@@ -1,18 +1,22 @@
 import os
 import re
-import requests
 import smtplib
-from datetime import date
+import ssl
+from datetime import datetime, date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 
-HOME_URL = "https://legis.la.gov/Legis/Home.aspx"
 
-BILL_START_PATTERN = re.compile(r"^(HB|SB)\s*\d+\b", re.IGNORECASE)
-BILL_NUMBER_PATTERN = re.compile(r"\b(HB|SB)\s*\d+\b", re.IGNORECASE)
+# =========================
+# CONFIG
+# =========================
+
+HOME_URL = "https://legis.la.gov/Legis/Home.aspx"
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -22,319 +26,463 @@ REQUEST_HEADERS = {
     )
 }
 
+BILL_PATTERN = re.compile(r"\b(HB|SB)\s*-?\s*(\d+)\b", re.IGNORECASE)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USERNAME)
+
+REQUEST_TIMEOUT = 30
+
+
+# =========================
+# LOGGING
+# =========================
+
+def log(message: str):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}")
+
+
+# =========================
+# HELPERS
+# =========================
+
+def normalize_bill_number(bill: str) -> str:
+    if not bill:
+        return ""
+    bill = bill.strip().upper()
+    bill = re.sub(r"\s+", "", bill)
+    bill = bill.replace("-", "")
+    return bill
+
+
+def extract_bill_numbers(text: str) -> list[str]:
+    found = set()
+    if not text:
+        return []
+
+    for match in BILL_PATTERN.finditer(text):
+        chamber = match.group(1).upper()
+        number = match.group(2)
+        found.add(f"{chamber}{number}")
+
+    return sorted(found)
+
+
+def clean_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return soup.get_text(separator=" ", strip=True)
+
+
+def get_requests_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    return session
+
+
+def safe_get(session: requests.Session, url: str) -> requests.Response | None:
+    try:
+        log(f"GET {url}")
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        log(f"SUCCESS {url} [{response.status_code}]")
+        return response
+    except Exception as e:
+        log(f"ERROR fetching {url}: {e}")
+        return None
+
+
+# =========================
+# SUPABASE
+# =========================
 
 def get_supabase() -> Client:
-    url = os.environ["SUPABASE_URL"]
-    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-    return create_client(url, key)
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise ValueError("SUPABASE_URL or SUPABASE_KEY is missing in environment variables.")
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def fetch_page(url: str) -> BeautifulSoup:
-    response = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
-
-
-def clean_bill_number(text):
-    match = re.search(r"\b(HB|SB)\s*(\d+)\b", str(text).strip(), re.IGNORECASE)
-    if match:
-        return f"{match.group(1).upper()}{match.group(2)}"
-    return str(text).strip().upper().replace(" ", "")
-
-
-def is_valid_web_link(url):
-    if not url:
-        return False
-    parsed = urlparse(url)
-    return parsed.scheme in ("http", "https")
-
-
-def deduplicate_bill_blocks(bill_blocks):
-    seen = set()
-    unique_blocks = []
-
-    for block in bill_blocks:
-        bill_number = block["bill_number"]
-        if bill_number not in seen:
-            seen.add(bill_number)
-            unique_blocks.append(block)
-
-    return unique_blocks
-
-
-def extract_bill_blocks(soup):
-    text = soup.get_text("\n", strip=True)
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-    bill_blocks = []
-    current_bill = None
-    current_lines = []
-
-    for line in lines:
-        if BILL_START_PATTERN.match(line):
-            if current_bill is not None:
-                bill_blocks.append(
-                    {
-                        "bill_number": current_bill,
-                        "text": " ".join(current_lines),
-                    }
-                )
-
-            current_bill = clean_bill_number(line)
-            current_lines = [line]
-        elif current_bill is not None:
-            current_lines.append(line)
-
-    if current_bill is not None:
-        bill_blocks.append(
-            {
-                "bill_number": current_bill,
-                "text": " ".join(current_lines),
-            }
-        )
-
-    return deduplicate_bill_blocks(bill_blocks)
-
-
-def extract_bills_from_page(soup):
-    bill_blocks = extract_bill_blocks(soup)
-
-    if bill_blocks:
-        return {block["bill_number"]: block["text"] for block in bill_blocks}
-
-    page_text = soup.get_text(" ", strip=True)
-    results = {}
-    for match in re.finditer(BILL_NUMBER_PATTERN, page_text):
-        bill_number = clean_bill_number(match.group(0))
-        results[bill_number] = bill_number
-
-    return results
-
-
-def extract_committee_links(home_soup):
-    rows = []
-    seen = set()
-
-    home_text = home_soup.get_text("\n", strip=True)
-    date_match = re.search(
-        r"TODAY'S MEETINGS,\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})",
-        home_text,
-        re.IGNORECASE,
+def get_active_tracked_bills(supabase: Client) -> list[dict]:
+    log("Loading active tracked bills from Supabase...")
+    response = (
+        supabase.table("tracked_bills")
+        .select("*")
+        .eq("is_active", True)
+        .execute()
     )
-    meeting_date = date_match.group(1) if date_match else "Date not found"
+    rows = response.data or []
 
-    for a in home_soup.find_all("a", href=True):
-        label = a.get_text(" ", strip=True)
-        href = a["href"].strip()
-        full_url = urljoin(HOME_URL, href)
-
-        if not is_valid_web_link(full_url):
-            continue
-        if "agenda.aspx" not in full_url.lower():
-            continue
-        if not label:
-            continue
-
-        tr = a.find_parent("tr")
-        if tr is None:
-            row_text = a.parent.get_text(" ", strip=True)
-        else:
-            row_text = tr.get_text(" ", strip=True)
-
-        key = (full_url, row_text)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        time_match = re.search(
-            r"(\d{1,2}:\d{2}\s*(a\.m\.|p\.m\.|A\.M\.|P\.M\.|am|pm))",
-            row_text,
-            re.IGNORECASE,
-        )
-
-        room_match = re.search(
-            r"(Room\s*[A-Z0-9\-]+)",
-            row_text,
-            re.IGNORECASE,
-        )
-
-        context_upper = row_text.upper()
-        chamber = "Senate" if "SENATE" in context_upper else "House"
-        committee_name = f"{chamber} {label.strip()}"
-
-        rows.append(
+    log(f"Active tracked bills count: {len(rows)}")
+    print("\n=== ACTIVE TRACKED BILLS ===")
+    for row in rows:
+        print(
             {
-                "committee_name": committee_name,
-                "url": full_url,
-                "meeting_date": meeting_date,
-                "meeting_time": time_match.group(1) if time_match else "Time not found",
-                "room": room_match.group(1).strip() if room_match else "Room not found",
+                "id": row.get("id"),
+                "user_email": row.get("user_email"),
+                "bill_number": row.get("bill_number"),
+                "bill_text": row.get("bill_text"),
+                "agenda_url": row.get("agenda_url"),
+                "is_active": row.get("is_active"),
             }
         )
+    print("=== END ACTIVE TRACKED BILLS ===\n")
 
     return rows
 
 
-def get_all_active_tracked_bills_grouped(supabase: Client):
-    response = (
-        supabase.table("tracked_bills")
-        .select("user_email,bill_number,bill_text,agenda_url")
-        .eq("is_active", True)
-        .execute()
-    )
+def already_sent_alert(supabase: Client, user_email: str, bill_number: str, agenda_url: str | None = None) -> bool:
+    bill_number = normalize_bill_number(bill_number)
 
-    rows = response.data or []
+    try:
+        query = (
+            supabase.table("sent_alerts")
+            .select("*")
+            .eq("user_email", user_email)
+            .eq("bill_number", bill_number)
+        )
 
-    grouped = {}
-    for row in rows:
-        email = row["user_email"].strip().lower()
-        bill_number = row["bill_number"].strip().upper()
-        bill_text = row.get("bill_text", "")
+        if agenda_url:
+            query = query.eq("agenda_url", agenda_url)
 
-        if email not in grouped:
-            grouped[email] = {}
-
-        grouped[email][bill_number] = bill_text
-
-    return grouped
-
-
-def log_sent_alert(supabase: Client, user_email: str, bill_number: str, meeting_url: str):
-    supabase.table("sent_alerts").insert(
-        {
-            "user_email": user_email.lower(),
-            "bill_number": bill_number.upper(),
-            "meeting_url": meeting_url,
-            "sent_date": date.today().isoformat(),
-        }
-    ).execute()
+        response = query.execute()
+        exists = bool(response.data)
+        log(
+            f"Duplicate check => user_email={user_email}, bill_number={bill_number}, "
+            f"agenda_url={agenda_url}, exists={exists}"
+        )
+        return exists
+    except Exception as e:
+        log(f"ERROR checking sent_alerts duplicate: {e}")
+        return False
 
 
-def find_matches(supabase: Client):
-    users = get_all_active_tracked_bills_grouped(supabase)
-    if not users:
-        return []
+def insert_sent_alert(
+    supabase: Client,
+    user_email: str,
+    bill_number: str,
+    agenda_url: str,
+    meeting_title: str = "",
+    meeting_date: str = "",
+):
+    bill_number = normalize_bill_number(bill_number)
 
-    home_soup = fetch_page(HOME_URL)
-    committee_links = extract_committee_links(home_soup)
+    rich_payload = {
+        "user_email": user_email,
+        "bill_number": bill_number,
+        "agenda_url": agenda_url,
+        "meeting_title": meeting_title,
+        "meeting_date": meeting_date,
+    }
 
+    minimal_payload = {
+        "user_email": user_email,
+        "bill_number": bill_number,
+    }
+
+    try:
+        log(f"Inserting into sent_alerts (rich payload): {rich_payload}")
+        supabase.table("sent_alerts").insert(rich_payload).execute()
+        log("Inserted sent_alerts row successfully with rich payload.")
+        return
+    except Exception as e:
+        log(f"Rich insert failed: {e}")
+
+    try:
+        log(f"Trying minimal insert into sent_alerts: {minimal_payload}")
+        supabase.table("sent_alerts").insert(minimal_payload).execute()
+        log("Inserted sent_alerts row successfully with minimal payload.")
+    except Exception as e:
+        log(f"Minimal insert also failed: {e}")
+
+
+# =========================
+# SCRAPING
+# =========================
+
+def discover_agenda_links(session: requests.Session) -> list[dict]:
+    """
+    Finds agenda links from the home page.
+    """
     results = []
+    seen = set()
 
-    for email, selected_bills in users.items():
-        user_matches = []
+    response = safe_get(session, HOME_URL)
+    if not response:
+        return results
 
-        for item in committee_links:
-            try:
-                page_soup = fetch_page(item["url"])
-                page_bills = extract_bills_from_page(page_soup)
+    soup = BeautifulSoup(response.text, "html.parser")
+    links = soup.find_all("a", href=True)
 
-                for bill_number, saved_text in selected_bills.items():
-                    if bill_number in page_bills:
-                        user_matches.append(
-                            {
-                                "email": email,
-                                "bill_number": bill_number,
-                                "saved_text": saved_text,
-                                "committee_name": item["committee_name"],
-                                "meeting_date": item["meeting_date"],
-                                "meeting_time": item["meeting_time"],
-                                "room": item["room"],
-                                "meeting_url": item["url"],
-                            }
-                        )
-            except Exception as e:
-                print(f"Error processing {item['url']}: {e}")
-                continue
+    log(f"Found {len(links)} links on home page.")
 
-        seen = set()
-        deduped = []
-        for m in user_matches:
-            key = (m["bill_number"], m["meeting_url"])
-            if key not in seen:
-                seen.add(key)
-                deduped.append(m)
+    for a in links:
+        href = a.get("href", "").strip()
+        text = a.get_text(" ", strip=True)
 
-        results.extend(deduped)
+        absolute = urljoin(HOME_URL, href)
+        href_lower = href.lower()
+        text_lower = text.lower()
+
+        if (
+            "agenda" in href_lower
+            or "agenda" in text_lower
+            or "meeting" in text_lower
+            or "committee" in text_lower
+        ):
+            if absolute not in seen:
+                seen.add(absolute)
+                results.append(
+                    {
+                        "meeting_title": text or "Agenda Link",
+                        "agenda_url": absolute,
+                        "source": "home_page",
+                    }
+                )
+
+    log(f"Discovered {len(results)} possible agenda/meeting links from home page.")
+
+    print("\n=== DISCOVERED AGENDA LINKS ===")
+    for item in results:
+        print(item)
+    print("=== END DISCOVERED AGENDA LINKS ===\n")
 
     return results
 
 
-def send_email(to_email, subject, body):
-    smtp_host = os.environ["SMTP_HOST"]
-    smtp_port = int(os.environ["SMTP_PORT"])
-    smtp_username = os.environ["SMTP_USERNAME"]
-    smtp_password = os.environ["SMTP_PASSWORD"]
-    from_email = os.environ["FROM_EMAIL"]
+def fetch_agenda_details(session: requests.Session, agenda_item: dict) -> dict | None:
+    agenda_url = agenda_item["agenda_url"]
+    response = safe_get(session, agenda_url)
+    if not response:
+        return None
+
+    text = clean_text(response.text)
+    found_bills = extract_bill_numbers(text)
+
+    details = {
+        "meeting_title": agenda_item.get("meeting_title", ""),
+        "agenda_url": agenda_url,
+        "source": agenda_item.get("source", ""),
+        "page_text": text,
+        "bills": found_bills,
+        "meeting_date": str(date.today()),
+    }
+
+    print("\n=== AGENDA DETAILS ===")
+    print("Meeting title:", details["meeting_title"])
+    print("Agenda URL:", details["agenda_url"])
+    print("Bills found:", details["bills"])
+    print("=== END AGENDA DETAILS ===\n")
+
+    return details
+
+
+def load_all_agendas(session: requests.Session) -> list[dict]:
+    discovered = discover_agenda_links(session)
+    agendas = []
+
+    log("Loading details for each discovered agenda link...")
+
+    for item in discovered:
+        details = fetch_agenda_details(session, item)
+        if details:
+            agendas.append(details)
+
+    log(f"Loaded {len(agendas)} agenda pages successfully.")
+
+    print("\n=== ALL MEETINGS FOUND ===")
+    for agenda in agendas:
+        print(
+            {
+                "meeting_title": agenda.get("meeting_title"),
+                "agenda_url": agenda.get("agenda_url"),
+                "meeting_date": agenda.get("meeting_date"),
+                "bills": agenda.get("bills"),
+            }
+        )
+    print("=== END ALL MEETINGS FOUND ===\n")
+
+    return agendas
+
+
+# =========================
+# EMAIL
+# =========================
+
+def send_email(to_email: str, subject: str, html_body: str):
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not EMAIL_FROM:
+        raise ValueError("SMTP configuration is missing. Check SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM.")
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = from_email
+    msg["From"] = EMAIL_FROM
     msg["To"] = to_email
-    msg.attach(MIMEText(body, "html"))
+    msg["Subject"] = subject
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_username, smtp_password)
-        server.sendmail(from_email, [to_email], msg.as_string())
+    msg.attach(MIMEText(html_body, "html"))
+
+    context = ssl.create_default_context()
+
+    log(f"Connecting to SMTP server {SMTP_HOST}:{SMTP_PORT}...")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls(context=context)
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        log(f"Sending email to {to_email}...")
+        server.sendmail(EMAIL_FROM, [to_email], msg.as_string())
+        log(f"Email sent successfully to {to_email}.")
 
 
-def build_email_body(items):
-    lines = []
-
-    for item in items:
-        lines.append(
-            f"""
-            <p>
-            <b>Bill:</b> {item['bill_number']}<br>
-            <b>Committee:</b> {item['committee_name']}<br>
-            <b>Date:</b> {item['meeting_date']}<br>
-            <b>Time:</b> {item['meeting_time']}<br>
-            <b>Room:</b> {item['room']}<br>
-            <b>Description:</b> {item['saved_text']}<br>
-            <b>Meeting Link:</b> <a href="{item['meeting_url']}">Open Agenda</a>
-            </p>
-            <hr>
-            """
-        )
-
+def build_email_html(bill_number: str, meeting_title: str, meeting_date: str, agenda_url: str) -> str:
     return f"""
-    <h2>Louisiana Bill Alert</h2>
-    <p>The following saved bill(s) matched upcoming committee meetings:</p>
-    {''.join(lines)}
+    <html>
+      <body>
+        <p>Hello,</p>
+        <p>Your tracked bill <strong>{bill_number}</strong> was found in a legislative agenda.</p>
+
+        <p>
+          <strong>Meeting:</strong> {meeting_title or "Committee Meeting"}<br>
+          <strong>Date Checked:</strong> {meeting_date}<br>
+          <strong>Agenda URL:</strong> <a href="{agenda_url}">{agenda_url}</a>
+        </p>
+
+        <p>Please review the agenda for details.</p>
+
+        <p>Regards,<br>Bill Tracker</p>
+      </body>
+    </html>
     """
 
 
-def main():
-    supabase = get_supabase()
-    matches = find_matches(supabase)
+# =========================
+# MATCHING / PROCESSING
+# =========================
 
-    if not matches:
-        print("No upcoming bill matched.")
-        return
+def process_alerts():
+    log("==== START alert-checker.py ====")
 
-    grouped = {}
-    for match in matches:
-        grouped.setdefault(match["email"], []).append(match)
+    try:
+        supabase = get_supabase()
+        session = get_requests_session()
 
-    for email, items in grouped.items():
-        if not items:
-            continue
+        tracked_rows = get_active_tracked_bills(supabase)
+        if not tracked_rows:
+            log("No active tracked bills found. Exiting.")
+            return
 
-        subject = f"Bill Alert: {len(items)} bill(s) matched"
-        body = build_email_body(items)
+        agendas = load_all_agendas(session)
+        if not agendas:
+            log("No agenda pages found. Exiting.")
+            return
 
-        send_email(email, subject, body)
+        tracked_by_bill = {}
+        for row in tracked_rows:
+            normalized = normalize_bill_number(row.get("bill_number", ""))
+            if not normalized:
+                continue
+            tracked_by_bill.setdefault(normalized, []).append(row)
 
-        for item in items:
-            log_sent_alert(
-                supabase,
-                email,
-                item["bill_number"],
-                item["meeting_url"],
-            )
+        print("\n=== TRACKED BILL MAP ===")
+        for bill, rows in tracked_by_bill.items():
+            print(bill, "=>", [{"id": r.get("id"), "user_email": r.get("user_email")} for r in rows])
+        print("=== END TRACKED BILL MAP ===\n")
 
-        print(f"Email sent to {email}")
+        total_matches = 0
+        total_sent = 0
 
+        for agenda in agendas:
+            agenda_url = agenda.get("agenda_url", "")
+            meeting_title = agenda.get("meeting_title", "")
+            meeting_date = agenda.get("meeting_date", str(date.today()))
+            agenda_bills = [normalize_bill_number(b) for b in agenda.get("bills", [])]
+            agenda_bill_set = set(agenda_bills)
+
+            print("\n=== MATCHING FOR AGENDA ===")
+            print("Meeting:", meeting_title)
+            print("Agenda URL:", agenda_url)
+            print("Agenda normalized bills:", sorted(agenda_bill_set))
+            print("Tracked normalized bills:", sorted(tracked_by_bill.keys()))
+
+            matches = sorted(agenda_bill_set.intersection(set(tracked_by_bill.keys())))
+            print("Matches:", matches)
+            print("=== END MATCHING FOR AGENDA ===\n")
+
+            if not matches:
+                continue
+
+            for matched_bill in matches:
+                total_matches += 1
+                matching_rows = tracked_by_bill.get(matched_bill, [])
+
+                for row in matching_rows:
+                    user_email = row.get("user_email")
+                    if not user_email:
+                        log(f"Skipping {matched_bill}: missing user_email in tracked row {row}")
+                        continue
+
+                    if already_sent_alert(supabase, user_email, matched_bill, agenda_url):
+                        log(
+                            f"Skipping email because alert already exists => "
+                            f"user={user_email}, bill={matched_bill}, agenda_url={agenda_url}"
+                        )
+                        continue
+
+                    subject = f"Bill Alert: {matched_bill} found on agenda"
+                    html_body = build_email_html(
+                        bill_number=matched_bill,
+                        meeting_title=meeting_title,
+                        meeting_date=meeting_date,
+                        agenda_url=agenda_url,
+                    )
+
+                    try:
+                        print("\n=== ABOUT TO SEND EMAIL ===")
+                        print("To:", user_email)
+                        print("Bill:", matched_bill)
+                        print("Meeting:", meeting_title)
+                        print("Agenda URL:", agenda_url)
+                        print("=== END ABOUT TO SEND EMAIL ===\n")
+
+                        send_email(user_email, subject, html_body)
+
+                        print("\n=== EMAIL SENT OK ===")
+                        print("To:", user_email)
+                        print("Bill:", matched_bill)
+                        print("=== END EMAIL SENT OK ===\n")
+
+                        insert_sent_alert(
+                            supabase=supabase,
+                            user_email=user_email,
+                            bill_number=matched_bill,
+                            agenda_url=agenda_url,
+                            meeting_title=meeting_title,
+                            meeting_date=meeting_date,
+                        )
+
+                        total_sent += 1
+
+                    except Exception as e:
+                        log(
+                            f"ERROR sending alert => user={user_email}, bill={matched_bill}, "
+                            f"agenda_url={agenda_url}, error={e}"
+                        )
+
+        log(f"Total matched bill occurrences: {total_matches}")
+        log(f"Total emails sent: {total_sent}")
+        log("==== END alert-checker.py ====")
+
+    except Exception as e:
+        log(f"FATAL ERROR in process_alerts(): {e}")
+
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
-    main()
+    process_alerts()
