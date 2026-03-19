@@ -573,7 +573,7 @@ def build_combined_email_html(alerts: list[dict]) -> str:
 log(f"Local Louisiana date used for matching: {today_local().isoformat()}")
 def process_alerts():
     log("==== START alert-checker.py ====")
-
+    log(f"Local Louisiana date used for matching: {today_local().isoformat()}")
     try:
         supabase = get_supabase()
         session = get_requests_session()
