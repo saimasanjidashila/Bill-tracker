@@ -130,7 +130,7 @@ def extract_insurance_committee_links(home_soup):
 
         if not is_valid_web_link(full_url):
             continue
-        if label.strip().upper() != "INSURANCE":
+        if "agenda.aspx" not in full_url.lower():
             continue
         if "agenda.aspx" not in full_url.lower():
             continue
